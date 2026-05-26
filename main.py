@@ -42,14 +42,12 @@ def romanize_lyrics(lyrics: str) -> str:
 
 async def search_genius(song: str, artist: str) -> dict:
     """Search Genius for a song and return the top result."""
-    headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
     query = f"{song} {artist}".strip()
 
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             "https://api.genius.com/search",
-            headers=headers,
-            params={"q": query},
+            params={"q": query, "access_token": GENIUS_TOKEN},
             timeout=10,
         )
         resp.raise_for_status()
@@ -99,13 +97,6 @@ async def fetch_lyrics_from_url(url: str) -> str:
 async def health():
     return {"status": "ok"}
 
-@app.get("/debug")
-async def debug():
-    token = os.environ.get("GENIUS_TOKEN")
-    return {
-        "token_set": token is not None,
-        "token_preview": token[:6] + "..." if token else "NOT FOUND"
-    }
 
 @app.get("/lyrics")
 async def get_lyrics(song: str, artist: str = ""):
