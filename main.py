@@ -19,17 +19,14 @@ kks = pykakasi.Kakasi()
 
 
 def romanize(text: str) -> str:
-    """Convert Japanese text to romaji using pykakasi."""
     result = kks.convert(text)
     romaji_parts = []
     for item in result:
-        # Use hepburn romaji; fall back to original if not Japanese
         romaji_parts.append(item["hepburn"] if item["hepburn"] else item["orig"])
     return " ".join(romaji_parts)
 
 
 def romanize_lyrics(lyrics: str) -> str:
-    """Romanize each line of lyrics, preserving line breaks."""
     lines = lyrics.split("\n")
     romanized_lines = []
     for line in lines:
@@ -40,10 +37,8 @@ def romanize_lyrics(lyrics: str) -> str:
     return "\n".join(romanized_lines)
 
 
-async def search_genius(song: str, artist: str) -> dict:
-    """Search Genius for a song and return the top result."""
-    query = f"{song} {artist}".strip()
-
+async def search_genius(query: str):
+    """Search Genius and return all hits."""
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             "https://api.genius.com/search",
@@ -51,35 +46,23 @@ async def search_genius(song: str, artist: str) -> dict:
             timeout=10,
         )
         resp.raise_for_status()
-        data = resp.json()
-
-    hits = data.get("response", {}).get("hits", [])
-    if not hits:
-        return None
-
-    top = hits[0]["result"]
-    return {
-        "title": top["title"],
-        "artist": top["primary_artist"]["name"],
-        "url": top["url"],
-        "thumbnail": top.get("song_art_image_thumbnail_url", ""),
-    }
+        return resp.json().get("response", {}).get("hits", [])
 
 
 async def fetch_lyrics_from_url(url: str) -> str:
     """Scrape lyrics from a Genius song page."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    }
     async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
-            follow_redirects=True,
-        )
+        resp = await client.get(url, headers=headers, timeout=15, follow_redirects=True)
         resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Genius wraps lyrics in containers with data-lyrics-container attribute
     containers = soup.find_all("div", attrs={"data-lyrics-container": "true"})
     if not containers:
         raise HTTPException(status_code=404, detail="Lyrics not found on page")
@@ -98,34 +81,85 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/debug")
+async def debug():
+    token = os.environ.get("GENIUS_TOKEN")
+    return {
+        "token_set": token is not None,
+        "token_preview": token[:6] + "..." if token else "NOT FOUND"
+    }
+
+
 @app.get("/lyrics")
 async def get_lyrics(song: str, artist: str = ""):
-    """
-    Fetch Japanese lyrics from Genius and return both original and romanized versions.
-    
-    Params:
-      song   - song title (required)
-      artist - artist name (optional but improves accuracy)
-    """
     if not GENIUS_TOKEN:
         raise HTTPException(status_code=500, detail="GENIUS_TOKEN not set on server")
 
-    # 1. Search Genius for the song
-    song_info = await search_genius(song, artist)
-    if not song_info:
+    query = f"{song} {artist}".strip()
+
+    # Strategy 1: Look for a pre-romanized version by "Genius Romanizations"
+    hits = await search_genius(f"{query} romanized")
+
+    romanized_hit = None
+    japanese_hit = None
+
+    for hit in hits:
+        result = hit["result"]
+        artist_name = result.get("primary_artist_names", "")
+        title = result.get("title", "").lower()
+
+        if "genius romanizations" in artist_name.lower():
+            romanized_hit = result
+            break
+
+    # Strategy 2: Also search for the original Japanese version
+    jp_hits = await search_genius(query)
+    for hit in jp_hits:
+        result = hit["result"]
+        # Skip Genius Romanizations entries for the Japanese version
+        if "genius romanizations" not in result.get("primary_artist_names", "").lower():
+            japanese_hit = result
+            break
+
+    if not romanized_hit and not japanese_hit:
         raise HTTPException(status_code=404, detail="Song not found on Genius")
 
-    # 2. Fetch the raw lyrics
-    raw_lyrics = await fetch_lyrics_from_url(song_info["url"])
+    # Use whichever we found as the primary source for metadata
+    primary = romanized_hit or japanese_hit
 
-    # 3. Romanize
-    romanized = romanize_lyrics(raw_lyrics)
-
-    return {
-        "title": song_info["title"],
-        "artist": song_info["artist"],
-        "thumbnail": song_info["thumbnail"],
-        "genius_url": song_info["url"],
-        "original_lyrics": raw_lyrics,
-        "romanized_lyrics": romanized,
+    result_data = {
+        "title": primary["title"],
+        "artist": primary["primary_artist_names"],
+        "thumbnail": primary.get("song_art_image_thumbnail_url", ""),
+        "genius_url": primary["url"],
+        "original_lyrics": "",
+        "romanized_lyrics": "",
     }
+
+    # Try to get pre-romanized lyrics from Genius Romanizations
+    if romanized_hit:
+        try:
+            romanized_lyrics = await fetch_lyrics_from_url(romanized_hit["url"])
+            result_data["romanized_lyrics"] = romanized_lyrics
+        except Exception:
+            romanized_hit = None  # fall through to pykakasi
+
+    # Get original Japanese lyrics and romanize with pykakasi if needed
+    if japanese_hit:
+        try:
+            original_lyrics = await fetch_lyrics_from_url(japanese_hit["url"])
+            result_data["original_lyrics"] = original_lyrics
+            # Only use pykakasi if we didn't get pre-romanized lyrics
+            if not result_data["romanized_lyrics"]:
+                result_data["romanized_lyrics"] = romanize_lyrics(original_lyrics)
+        except Exception:
+            pass
+
+    # If we only got the romanized version and no original
+    if result_data["romanized_lyrics"] and not result_data["original_lyrics"]:
+        result_data["original_lyrics"] = result_data["romanized_lyrics"]
+
+    if not result_data["romanized_lyrics"]:
+        raise HTTPException(status_code=404, detail="Could not fetch lyrics. Genius may be blocking the request.")
+
+    return result_data
