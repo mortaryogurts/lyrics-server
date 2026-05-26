@@ -99,6 +99,13 @@ async def fetch_lyrics_from_url(url: str) -> str:
 async def health():
     return {"status": "ok"}
 
+@app.get("/debug")
+async def debug():
+    token = os.environ.get("GENIUS_TOKEN")
+    return {
+        "token_set": token is not None,
+        "token_preview": token[:6] + "..." if token else "NOT FOUND"
+    }
 
 @app.get("/lyrics")
 async def get_lyrics(song: str, artist: str = ""):
